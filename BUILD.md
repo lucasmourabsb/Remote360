@@ -66,6 +66,67 @@ run on the console. The failed build is preserved in `backups/failed-0.1.2/`.
 
 ## Current fluency build and capture profiler
 
+The first `remote360_snapshot.xex` produced a fatal error at Apply Changes
+on the physical console. Retire that build. The exact cause was not captured.
+The [plugin manager's Apply Changes code](https://github.com/ClementDreptin/X360PluginManager/blob/main/src/PluginManager.cpp)
+forcibly unloads deselected plugins before loading selected ones. Remote360
+builds may still have live threads and controller hooks, so never deselect a
+running Remote360 build to swap versions. Reboot to Aurora between builds,
+then run `python3 tools/watch_xbox.py XBOX_IP preflight` to confirm that
+no Remote360 module is resident.
+
+On hardware, `remote360_snapshot32.xex` started in Aurora but the console
+went black twice when launching Bully, before the client requested video.
+Bully then started normally after a reboot without Remote360. The cause
+inside the module has not been isolated. The follow-up build starts the
+encoder thread only when it receives a video request.
+
+1. `bash xbox360/build-video.sh --snapshot-check` builds
+   `remote360_snapshot_check.xex`. It records process attach and returns
+   without starting a thread or enabling network, video or controller code.
+   In a fresh session, with the Android app disconnected, load only this
+   module and return to Aurora. Check
+   `python3 tools/watch_xbox.py XBOX_IP snapshot-check --seconds 5` for
+   `snapshot_load_stage=2` and `heartbeat=0`.
+2. Only after that check succeeds, reboot and run preflight again.
+   `bash xbox360/build-video.sh --snapshot-32` builds
+   `remote360_snapshot32c.xex` with the same 32-bit display reads as the
+   previous tiled reader. It copies the live surface into private memory
+   before converting it and checks whether the source changed during the copy.
+   Load only this module. With the client still disconnected, confirm
+   `snapshot_load_stage=3`, a moving heartbeat and `parallel_ready=0`.
+   On Aurora, connect the Thor and request 1280 × 720,
+   60 FPS with Priorizar fluidez off. The revised APK does this
+   automatically for resolutions above 640 × 360; the 0.2.1-rc1 APK still works
+   with that setting turned off manually.
+   If the full scanout allocation fails, the module drops to the fused BC1
+   path and keeps serving video until the client changes its settings.
+3. Run `python3 tools/watch_xbox.py XBOX_IP snapshot-32c --seconds 60 --summary`.
+   Compare the increments of `snapshot_attempts`, `snapshot_accepted` and
+   `snapshot_recycled` with the frames the app reports drawing.
+   `snapshot_copy_us` includes the copy and input service. The complete
+   capture, conversion, encode and send cycle has about 16.7 ms at 60 FPS.
+
+`bash xbox360/build-video.sh --play` builds the 0.2.1 release candidate.
+It uses the same controller hooks and video packet formats as the previous builds.
+The two threads split BC1 capture and encoding by block rows. For JPEG, they
+split the copy and encode stages at MCU row boundaries. The shared scanout is
+read only. The sender keeps the same XOR groups and interleaves up to four groups
+at a time. `python3 tools/watch_xbox.py XBOX_IP play --seconds 60 --summary`
+reports capture, encode, send and app draw rates. Pass `--map xbox360/out/remote360_play.map`
+if the address differs in a local build. In the fast mode the capture timing
+includes BC1 compression because the two run together.
+
+Host tests compare the fused BC1 output to the previous pipeline and compare
+parallel JPEG bytes with serial JPEG. The emulator loopback can also feed
+animated JPEG sequences using `tools/video_lab.py --jpeg-dir DIR`; file names
+use `1280x720-*.jpg` or `1280x720.jpg`. The optional `--control` file lets the
+test switch between clean traffic, delayed parity, packet loss and simulated
+console restarts. Emulator timings cover the Android receive and draw path.
+The console capture and Wi-Fi throughput require separate hardware measurement.
+
+## Previous fluency builds
+
 `bash xbox360/build-video.sh --latency` builds the Xbox module for Remote360 0.1.9.
 `--latency-probe` builds the timing experiment with cached validation of the 16 MiB
 physical mapping. `--latency-scan` keeps the normal page checks, uses a cheaper BC1
@@ -91,5 +152,6 @@ host input packet and status decoder. The original 0.1.2 console launch failed.
 After a physical restart, a fresh read-only check confirmed recovery to Aurora.
 The revised loader and probe have only been checked locally.
 
-Build success, static checks and APK signature verification are recorded in the package. Audio,
-actual gameplay, loader behavior, image correctness and end-to-end latency remain unverified.
+The physical checkpoints for earlier video builds are recorded in README.md.
+For 0.2.1-rc1, console loader behavior, performance in games and end-to-end latency
+require a physical test with the exact candidate XEX and APK.
