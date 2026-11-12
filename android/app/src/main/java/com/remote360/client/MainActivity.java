@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -44,7 +45,7 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
     private final Handler main = new Handler(Looper.getMainLooper());
     private EditText ipField;
     private TextView statusView;
-    private TextView playbackNotice;
+    private TextView playbackNotice, playbackStats, resolutionNotice;
     private CheckBox videoOption;
     private CheckBox fastVideoOption;
     private Spinner resolutionOption, frameRateOption;
@@ -63,6 +64,9 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
     private final Object frameLock = new Object();
     private UdpClient.VideoFrame pendingFrame;
     private UdpClient pendingSource;
+    private boolean presentationScheduled;
+    private UdpClient.VideoFrame drawingFrame;
+    private UdpClient drawingSource;
     private Protocol.VideoStatus xboxVideoStatus;
     private boolean xboxSendFailed;
     private Vibrator activeVibrator;
@@ -91,12 +95,27 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
 
-        videoView = new ImageView(this);
+        videoView = new ImageView(this) {
+            @Override protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                recordDrawnFrame();
+            }
+        };
         videoView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         videoView.setBackgroundColor(Color.BLACK);
         videoView.setVisibility(View.INVISIBLE);
         videoView.setOnClickListener(v -> showPanel());
         root.addView(videoView, new FrameLayout.LayoutParams(-1, -1));
+
+        playbackStats = new TextView(this);
+        playbackStats.setTextColor(Color.WHITE);
+        playbackStats.setTextSize(12);
+        playbackStats.setBackgroundColor(0x99000000);
+        playbackStats.setPadding(dp(8), dp(4), dp(8), dp(4));
+        playbackStats.setVisibility(View.GONE);
+        FrameLayout.LayoutParams statsParams = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
+        statsParams.setMargins(dp(8), dp(8), dp(8), dp(8));
+        root.addView(playbackStats, statsParams);
 
         playbackNotice = new TextView(this);
         playbackNotice.setTextColor(Color.WHITE);
@@ -185,6 +204,12 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
         }
         resolutionOption = addSetting(videoSettings, "Resolução", resolutions, prefs.getInt(PREF_RESOLUTION, 0));
         frameRateOption = addSetting(videoSettings, "FPS desejado", rates, prefs.getInt(PREF_FRAME_RATE, 2));
+        resolutionNotice = new TextView(this);
+        resolutionNotice.setText("Essa resolução usa o modo qualidade. A imagem e os FPS dependem do Xbox.");
+        resolutionNotice.setTextColor(0xFFB0B0B0);
+        resolutionNotice.setGravity(Gravity.CENTER);
+        resolutionNotice.setVisibility(View.GONE);
+        connectPanel.addView(resolutionNotice, new LinearLayout.LayoutParams(-1, -2));
         AdapterView.OnItemSelectedListener updateSettings = new AdapterView.OnItemSelectedListener() {
             @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
                 applyVideoSettings();
@@ -242,6 +267,7 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
 
         connect.setOnClickListener(v -> connect());
         setContentView(root);
+        applyVideoSettings();
     }
 
     private int dp(int value) {
@@ -276,13 +302,20 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
         int resolution = resolutionOption.getSelectedItemPosition();
         int rate = frameRateOption.getSelectedItemPosition();
         if (resolution < 0 || rate < 0) return;
+        boolean fastAvailable = Protocol.supportsFastVideo(resolution);
+        fastVideoOption.setVisibility(fastAvailable ? View.VISIBLE : View.GONE);
+        resolutionNotice.setVisibility(fastAvailable ? View.GONE : View.VISIBLE);
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putInt(PREF_RESOLUTION, resolution).putInt(PREF_FRAME_RATE, rate)
                 .putBoolean(PREF_FAST_VIDEO, fastVideoOption.isChecked()).apply();
         if (client != null) {
-            client.setVideoSettings(resolution, rate, fastVideoOption.isChecked());
+            client.setVideoSettings(resolution, rate, isFastVideoRequested());
             resetFps();
         }
+    }
+
+    private boolean isFastVideoRequested() {
+        return fastVideoOption.getVisibility() == View.VISIBLE && fastVideoOption.isChecked();
     }
 
     private void connect() {
@@ -315,6 +348,8 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
             pendingFrame = null;
             pendingSource = null;
         }
+        drawingSource = null;
+        drawingFrame = null;
         xboxVideoStatus = null;
         xboxSendFailed = false;
         main.removeCallbacks(connectionHealth);
@@ -339,6 +374,7 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
     private void showPanel() {
         if (connectOverlay != null) connectOverlay.setVisibility(View.VISIBLE);
         if (playbackNotice != null) playbackNotice.setVisibility(View.GONE);
+        if (playbackStats != null) playbackStats.setVisibility(View.GONE);
     }
 
     private void showVideo() {
@@ -351,7 +387,15 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
     }
 
     private void updatePlaybackNotice() {
-        if (!receivedVideo || connectOverlay.getVisibility() == View.VISIBLE || videoIsCurrent()) {
+        boolean playing = receivedVideo && connectOverlay.getVisibility() != View.VISIBLE;
+        boolean current = videoIsCurrent();
+        playbackStats.setVisibility(playing && current ? View.VISIBLE : View.GONE);
+        if (playing && current) {
+            String stats = videoBitmap.getWidth() + " × " + videoBitmap.getHeight()
+                    + (displayedFps > 0 ? " · " + displayedFps + " FPS" : "");
+            if (!stats.contentEquals(playbackStats.getText())) playbackStats.setText(stats);
+        }
+        if (!playing || current) {
             playbackNotice.setVisibility(View.GONE);
             return;
         }
@@ -429,7 +473,7 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
             String video = "";
             if (videoOption.isChecked()) {
                 if (videoIsCurrent()) {
-                    video = "\nRecebendo " + videoBitmap.getWidth() + " × " + videoBitmap.getHeight()
+                    video = "\nExibindo " + videoBitmap.getWidth() + " × " + videoBitmap.getHeight()
                             + (displayedFps > 0 ? " · " + displayedFps + " FPS" : "");
                 } else {
                     video = "\n" + (receivedVideo ? "Vídeo interrompido" : "Vídeo solicitado")
@@ -437,9 +481,9 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
                 }
                 if (xboxVideoStatus != null && !xboxVideoStatus.configurable) {
                     video += "\nAtualize o módulo do Xbox para aplicar a resolução e os FPS escolhidos.";
-                } else if (xboxVideoStatus != null && fastVideoOption.isChecked() && !xboxVideoStatus.fastSupported) {
+                } else if (xboxVideoStatus != null && isFastVideoRequested() && !xboxVideoStatus.fastSupported) {
                     video += "\nCarregue o módulo novo no Xbox para ativar a fluidez.";
-                } else if (xboxVideoStatus != null && fastVideoOption.isChecked() && xboxVideoStatus.captureLimited) {
+                } else if (xboxVideoStatus != null && isFastVideoRequested() && xboxVideoStatus.captureLimited) {
                     video += "\nModo fluidez ajustou a resolução.";
                 } else if (xboxVideoStatus != null && xboxVideoStatus.sourceLimited) {
                     video += "\nO jogo fornece " + xboxVideoStatus.sourceWidth + " × " + xboxVideoStatus.sourceHeight + ".";
@@ -499,10 +543,12 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
     public void onVideoFrame(UdpClient source, UdpClient.VideoFrame frame) {
         synchronized (frameLock) {
             if (client != source) return;
-            boolean needsPost = pendingFrame == null;
             pendingFrame = frame;
             pendingSource = source;
-            if (needsPost) main.post(this::presentVideoFrame);
+            if (!presentationScheduled) {
+                presentationScheduled = true;
+                main.post(() -> videoView.postOnAnimation(this::presentVideoFrame));
+            }
         }
     }
 
@@ -514,8 +560,38 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
             frame = pendingFrame;
             pendingSource = null;
             pendingFrame = null;
+            presentationScheduled = false;
         }
-        if (frame == null || client != source || !videoOption.isChecked()) return;
+        if (frame == null || client != source || !source.isCurrentVideo(frame)) return;
+
+        Bitmap next = frame.bitmap;
+        if (next == null) {
+            if (rawBitmap == null || rawBitmap.getWidth() != frame.width || rawBitmap.getHeight() != frame.height) {
+                rawBitmap = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.RGB_565);
+            }
+            rawBitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame.rgb565));
+            next = rawBitmap;
+        }
+        drawingSource = source;
+        drawingFrame = frame;
+        if (next != videoBitmap) {
+            videoBitmap = next;
+            videoView.setImageBitmap(next);
+        }
+        videoView.setVisibility(View.VISIBLE);
+        if (!receivedVideo) {
+            receivedVideo = true;
+            connectOverlay.setVisibility(View.INVISIBLE);
+        }
+        videoView.invalidate();
+    }
+
+    private void recordDrawnFrame() {
+        UdpClient source = drawingSource;
+        UdpClient.VideoFrame frame = drawingFrame;
+        drawingSource = null;
+        drawingFrame = null;
+        if (frame == null || client != source || !source.isCurrentVideo(frame)) return;
         long now = SystemClock.elapsedRealtime();
         if (lastFrameAt == 0 || now - lastFrameAt >= 2000) resetFps();
         if (fpsWindowStart == 0) {
@@ -529,27 +605,6 @@ public final class MainActivity extends Activity implements UdpClient.Listener {
             fpsWindowStart = now;
         }
         lastFrameAt = now;
-
-        Bitmap next = frame.bitmap;
-        if (next == null) {
-            if (rawBitmap == null || rawBitmap.getWidth() != frame.width || rawBitmap.getHeight() != frame.height) {
-                rawBitmap = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.RGB_565);
-            }
-            rawBitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame.rgb565));
-            next = rawBitmap;
-        }
-        if (next != videoBitmap) {
-            videoBitmap = next;
-            videoView.setImageBitmap(next);
-        }
-        videoView.setVisibility(View.VISIBLE);
-        if (!receivedVideo) {
-            receivedVideo = true;
-            showVideo();
-        } else {
-            updatePlaybackNotice();
-        }
-        videoView.invalidate();
         source.frameRendered(frame.id);
     }
 
