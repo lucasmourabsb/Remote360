@@ -21,6 +21,7 @@ static u8 frame[R360_VIDEO_BYTES];
 static struct r360_video_layout jpeg;
 static const u8 *pixels = frame;
 static const struct r360_video_layout *layout = &r360_rgb565;
+static struct r360_packet_order order;
 void pattern(u32 id) { if (layout == &r360_rgb565) r360_video_test_pattern(frame, id); }
 void set_jpeg(const u8 *data, u32 size, u16 width, u16 height) {
     jpeg = (struct r360_video_layout){width, height,
@@ -34,8 +35,16 @@ int parity(u8 *packet, u32 id, u32 group) { return r360_layout_parity_packet(pac
 u32 chunk_count(void) { return layout->chunks; }
 u32 group_count(void) { return (layout->chunks + R360_VIDEO_PARITY_GROUP - 1) / R360_VIDEO_PARITY_GROUP; }
 u32 group_size(void) { return R360_VIDEO_PARITY_GROUP; }
+void start_order(bool parity) { r360_packet_order_init(&order, layout->chunks, parity); }
+int ordered_packet(u8 *packet, u32 id) {
+    u32 index;
+    bool parity;
+    if (!r360_packet_order_next(&order, &index, &parity)) return 0;
+    return parity ? r360_layout_parity_packet(packet, layout, pixels, id, index)
+                  : r360_layout_packet(packet, layout, pixels, id, index);
+}
 """
-MODES = ("clean", "loss", "double_loss", "stall", "capture_error", "burst", "restart", "offline")
+MODES = ("clean", "loss", "double_loss", "late_parity", "stall", "capture_error", "burst", "restart", "offline")
 PROFILES = ((320, 180), (512, 288), (640, 360), (960, 540), (1280, 720), (1920, 1080))
 RATES = (15, 24, 30, 60)
 
@@ -56,18 +65,36 @@ def build_codec(directory):
     for function in (lib.data, lib.parity):
         function.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32)
         function.restype = ctypes.c_int
+    lib.start_order.argtypes = (ctypes.c_bool,)
+    lib.start_order.restype = None
+    lib.ordered_packet.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    lib.ordered_packet.restype = ctypes.c_int
     return lib
 
 
+def ordered_packets(codec, frame, parity):
+    codec.pattern(frame)
+    codec.start_order(parity)
+    buffer = ctypes.create_string_buffer(1204)
+    while (length := codec.ordered_packet(buffer, frame)) > 0:
+        yield buffer.raw[:length]
+
+
 def packets(codec, frame, parity, mode):
+    if mode in ("clean", "burst", "restart"):
+        yield from ordered_packets(codec, frame, parity)
+        return
     codec.pattern(frame)
     buffer = ctypes.create_string_buffer(1204)
     size = codec.group_size()
     count = codec.chunk_count()
-    for group in range(codec.group_count()):
+    groups = codec.group_count()
+    for group in range(groups):
         first = group * size
         last = min(first + size, count)
         lost = min(2 if mode == "double_loss" else 1, last - first) if mode in ("loss", "double_loss") else 0
+        if mode == "late_parity" and parity and count > 1 and group + 1 == groups:
+            lost = 1
         for index in range(first, last - lost):
             length = codec.data(buffer, frame, index)
             yield buffer.raw[:length]
@@ -88,6 +115,8 @@ def run(codec, port, control, seconds, report_interval, fixtures):
     next_frame = next_status = next_control = started
     report_at = started + report_interval
     mode = "clean"
+    sequence = ()
+    held_parity = None
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
         server.bind(("127.0.0.1", port))
         server.setblocking(False)
@@ -98,6 +127,7 @@ def run(codec, port, control, seconds, report_interval, fixtures):
                     candidate = control.read_text().strip() if control else "clean"
                     if candidate in MODES and candidate != mode:
                         mode = candidate
+                        held_parity = None
                         if mode == "restart":
                             frame = console_frames = 0
                         print(json.dumps({"mode": mode, "elapsed": round(now - started, 2)}), flush=True)
@@ -113,6 +143,7 @@ def run(codec, port, control, seconds, report_interval, fixtures):
                     if len(packet) == 28 and packet[:6] == b"R360\x01\x01":
                         if peer != sender:
                             displayed = last_displayed = 0
+                            held_parity = None
                         peer = sender
                         flags = packet[6]
                         if fixtures and flags & 0x40 and flags & 2:
@@ -125,11 +156,12 @@ def run(codec, port, control, seconds, report_interval, fixtures):
                             fps = RATES[rate] if 0 <= rate < len(RATES) else 10
                             if profile in fixtures:
                                 width, height = PROFILES[profile]
-                                fixture = fixtures[profile]
-                                codec.set_jpeg(fixture, len(fixture), width, height)
+                                sequence = fixtures[profile]
                             else:
                                 width, height = PROFILES[0]
-                                codec.set_jpeg(None, 0, width, height)
+                                sequence = ()
+                            codec.set_jpeg(None, 0, width, height)
+                            held_parity = None
                             next_frame = now
                             print(json.dumps({"resolution": [width, height], "target_fps": fps,
                                               "input_profile": profile, "input_rate": rate}), flush=True)
@@ -165,11 +197,21 @@ def run(codec, port, control, seconds, report_interval, fixtures):
                 if mode in ("stall", "capture_error"):
                     continue
                 frame += 1
+                if sequence:
+                    fixture = sequence[frame % len(sequence)]
+                    codec.set_jpeg(fixture, len(fixture), width, height)
                 for index, packet in enumerate(packets(codec, frame, bool(flags & 0x10), mode)):
                     burst_size = 48 if fixtures else 24
                     if mode != "burst" and index and index % burst_size == 0:
                         time.sleep(0.0015 if fixtures else 0.004)
+                    if (mode == "late_parity" and codec.chunk_count() > 1 and packet[5] in (6, 11)
+                            and struct.unpack_from("<H", packet, 10)[0] + 1 == codec.group_count()):
+                        held_parity = packet
+                        continue
                     server.sendto(packet, peer)
+                    if index == 0 and held_parity is not None:
+                        server.sendto(held_parity, peer)
+                        held_parity = None
                 frames += 1
                 console_frames += 1
 
@@ -180,7 +222,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=120)
     parser.add_argument("--report-interval", type=float, default=20)
     parser.add_argument("--control", type=Path, help="file containing one of: " + ", ".join(MODES))
-    parser.add_argument("--jpeg-dir", type=Path, help="directory with WIDTHxHEIGHT.jpg test frames")
+    parser.add_argument("--jpeg-dir", type=Path, help="WIDTHxHEIGHT.jpg or WIDTHxHEIGHT-*.jpg test frames")
     args = parser.parse_args()
     if args.seconds <= 0 or args.report_interval <= 0:
         parser.error("seconds and report interval must be positive")
@@ -188,8 +230,9 @@ def main():
     if args.jpeg_dir:
         for profile, (width, height) in enumerate(PROFILES[2:], start=2):
             path = args.jpeg_dir / f"{width}x{height}.jpg"
-            if path.is_file():
-                fixtures[profile] = path.read_bytes()
+            paths = ([path] if path.is_file() else []) + sorted(args.jpeg_dir.glob(f"{width}x{height}-*.jpg"))
+            if paths:
+                fixtures[profile] = tuple(path.read_bytes() for path in paths)
         if not fixtures:
             parser.error("JPEG test frame directory has no known resolutions")
     with tempfile.TemporaryDirectory(prefix="remote360-codec-") as directory:
