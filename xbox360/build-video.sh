@@ -32,7 +32,7 @@ case "${1:-}" in
                -DR360_VIDEO_INTERVAL_MS=33 -DR360_VIDEO_PACKETS_PER_BURST=56)
         sources+=(xinput_360.c detour.c video_jpeg.c)
         ;;
-    --latency|--latency-probe|--latency-scan|--latency-dual)
+    --latency|--latency-probe|--latency-scan|--latency-dual|--play|--snapshot-32|--snapshot-check)
         name=remote360_latency
         flags=(-DXA_HOOK_CAPS=1 -DXA_HOOK_SET=1 -DR360_EXPERIMENTAL_MEDIA -DR360_VIDEO_SETTINGS
                -DR360_LOW_LATENCY -DR360_VIDEO_INTERVAL_MS=33 -DR360_VIDEO_PACKETS_PER_BURST=56)
@@ -45,10 +45,21 @@ case "${1:-}" in
         elif [[ "$1" == --latency-dual ]]; then
             name=remote360_latency_dual2
             flags+=(-DR360_CAPTURE_PROFILE -DR360_FAST_SCAN -DR360_PARALLEL_BC1)
+        elif [[ "$1" == --play || "$1" == --snapshot-32 || "$1" == --snapshot-check ]]; then
+            name=remote360_play
+            flags+=(-DR360_CAPTURE_PROFILE -DR360_FAST_SCAN -DR360_PARALLEL_BC1 -DR360_FUSED_SCAN)
+            if [[ "$1" != --play ]]; then
+                name=remote360_snapshot32c
+                flags+=(-DR360_SCANOUT_SNAPSHOT)
+                if [[ "$1" == --snapshot-check ]]; then
+                    name=remote360_snapshot_check
+                    flags+=(-DR360_SNAPSHOT_LOAD_ONLY)
+                fi
+            fi
         fi
         sources+=(xinput_360.c detour.c video_jpeg.c)
         ;;
-    *) printf '%s\n' 'Usage: build-video.sh [--fast-monitor|--controls|--next|--settings|--latency|--latency-probe|--latency-scan|--latency-dual]' >&2; exit 2 ;;
+    *) printf '%s\n' 'Usage: build-video.sh [--fast-monitor|--controls|--next|--settings|--latency|--latency-probe|--latency-scan|--latency-dual|--play|--snapshot-32|--snapshot-check]' >&2; exit 2 ;;
 esac
 
 "$TC/bin/clang" -O2 -Wall -msoft-float -fno-zero-initialized-in-bss \

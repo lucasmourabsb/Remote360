@@ -12,7 +12,7 @@ DLL_LINK="-Wl,/entry:DllMain,/align:0x1000,/base:0x91C00000,/map:out/remote360.m
 CFLAGS_DLL="-O2 -Wall -Wno-unused-parameter -fno-zero-initialized-in-bss -msoft-float"
 
 "$TC/bin/clang" $CFLAGS_DLL -DXA_HOOK_CAPS=1 -DXA_HOOK_SET=1 $DLL_LINK \
-    thunks.s remote360.c platform_min.c xinput_360.c detour.c -o out/remote360.exe
+    -x assembler-with-cpp thunks.s -x c remote360.c platform_min.c xinput_360.c detour.c -o out/remote360.exe
 "$TC/bin/synthxex-patched" -i out/remote360.exe -o out/remote360.xex -t sysdll >/dev/null
 
 LOADER_FLAGS="-O2 -Wall -Wextra -ffreestanding -msoft-float -fno-zero-initialized-in-bss -nostdlib"

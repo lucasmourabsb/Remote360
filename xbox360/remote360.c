@@ -9,6 +9,14 @@
 #include "kernel_17559.h"
 #include "net_360.h"
 #include "video_pixels.h"
+#ifdef R360_FUSED_SCAN
+#include "video_scan.h"
+#endif
+#ifdef R360_SCANOUT_SNAPSHOT
+#include "video_snapshot.h"
+#define SNAPSHOT_MAX_BYTES (16u * 1024u * 1024u)
+#define SNAPSHOT_CHUNK_BYTES (32u * 1024u)
+#endif
 #ifdef R360_VIDEO_SETTINGS
 #include "../protocol/video_profiles.h"
 #include "video_jpeg.h"
@@ -119,6 +127,14 @@ struct r360_status_block {
 	volatile u32 parallel_ready, parallel_frames, parallel_overruns;
 	volatile u32 parallel_worker_us, parallel_main_us;
 #endif
+#ifdef R360_FUSED_SCAN
+	volatile u32 fused_frames, fused_cancellations, parallel_jpeg_frames;
+#endif
+#ifdef R360_SCANOUT_SNAPSHOT
+	volatile u32 snapshot_attempts, snapshot_accepted, snapshot_recycled;
+	volatile u32 snapshot_copy_us, snapshot_alloc_errors, snapshot_cancelled;
+	volatile u32 snapshot_load_stage;
+#endif
 };
 
 __attribute__((used)) struct r360_status_block g_r360 = {
@@ -174,6 +190,13 @@ static u32 video_config_generation;
 static u64 next_video_due;
 static u16 *jpeg_pixels;
 static u8 *jpeg_output;
+#ifdef R360_FUSED_SCAN
+static u8 *jpeg_bottom;
+#endif
+#ifdef R360_SCANOUT_SNAPSHOT
+static u8 *scanout_snapshot;
+static u32 snapshot_capacity;
+#endif
 static u32 jpeg_pixel_capacity;
 static u32 jpeg_columns[1920];
 static u32 jpeg_rows[1080];
@@ -211,6 +234,12 @@ struct r360_video_job {
 #endif
 #ifdef R360_FAST_SCAN
 	bool reconstruct_rows;
+#endif
+#ifdef R360_FUSED_SCAN
+	bool fused;
+#endif
+#ifdef R360_SCANOUT_SNAPSHOT
+	bool staged;
 #endif
 };
 
@@ -631,7 +660,11 @@ static bool service_video_job(void *context)
 {
 	const struct r360_video_job *job = context;
 	service_input(job->socket);
-	if (peer_valid && xa_now_ms() - last_status_ms >= STATUS_INTERVAL_MS) {
+	u64 now = xa_now_ms();
+#if defined(R360_FUSED_SCAN) && !defined(R360_VIDEO_ONLY)
+	service_controller(now);
+#endif
+	if (peer_valid && now - last_status_ms >= STATUS_INTERVAL_MS) {
 		send_status(job->socket);
 		if (video_status_requested)
 			send_video_status(job->socket);
@@ -662,6 +695,7 @@ static bool service_fast_job(struct r360_video_job *job)
 #endif
 }
 
+#ifndef R360_FUSED_SCAN
 static bool encode_fast_rows(u8 *out, const u16 *pixels, u32 width, u32 first, u32 end,
 			     struct r360_video_job *job)
 {
@@ -675,6 +709,7 @@ static bool encode_fast_rows(u8 *out, const u16 *pixels, u32 width, u32 first, u
 	return true;
 }
 #endif
+#endif
 
 #ifdef R360_PARALLEL_BC1
 /* The controller/network thread already runs on CPU 3 (core 1). CPU 5 is
@@ -683,14 +718,34 @@ static bool encode_fast_rows(u8 *out, const u16 *pixels, u32 width, u32 first, u
 #define ENCODE_HANDOFF() __asm__ __volatile__("sync" ::: "memory")
 extern void R360EncodeThread(void);
 static HANDLE encode_start, encode_done;
+#ifdef R360_FUSED_SCAN
+struct r360_jpeg_encode {
+	const u16 *pixels;
+	u8 *output;
+	u32 width, height, first;
+	bool low_quality;
+};
+enum r360_work_kind { R360_WORK_BC1, R360_WORK_JPEG_COPY, R360_WORK_JPEG_ENCODE };
+static enum r360_work_kind work_kind;
+static union {
+	struct r360_scan_slice scan;
+	struct r360_jpeg_capture copy;
+	struct r360_jpeg_encode jpeg;
+} encode_work;
+static int encode_work_result;
+#else
 static struct {
 	u8 *output;
 	const u16 *pixels;
 	u32 width, first, end;
 } encode_work;
+#endif
 /* Only the network thread updates these two local flags. */
 static bool encoder_thread_created, encoder_inflight;
 static u32 encoder_consecutive_overruns;
+#ifdef R360_SCANOUT_SNAPSHOT
+static bool encoder_start_attempted;
+#endif
 
 __attribute__((used, noinline)) u32 R360EncodeThreadC(void *context)
 {
@@ -698,8 +753,26 @@ __attribute__((used, noinline)) u32 R360EncodeThreadC(void *context)
 	while (NtWaitForSingleObjectEx((u32)encode_start, 0, 0, 0) == 0) {
 		ENCODE_HANDOFF();
 		u32 started = capture_ticks();
+#ifdef R360_FUSED_SCAN
+		switch (work_kind) {
+		case R360_WORK_BC1:
+			r360_scan_bc1(&encode_work.scan, 0, 0);
+			break;
+		case R360_WORK_JPEG_COPY:
+			r360_copy_jpeg_rows(&encode_work.copy, 0, 0);
+			break;
+		case R360_WORK_JPEG_ENCODE: {
+			const struct r360_jpeg_encode *work = &encode_work.jpeg;
+			encode_work_result = r360_encode_jpeg_slice(work->pixels, work->width, work->height,
+								   work->first, work->height, work->output,
+								   R360_JPEG_MAX_BYTES, work->low_quality, 0, 0);
+			break;
+		}
+		}
+#else
 		encode_fast_rows(encode_work.output, encode_work.pixels, encode_work.width,
 				 encode_work.first, encode_work.end, 0);
+#endif
 		g_r360.parallel_worker_us = capture_us(capture_ticks() - started);
 		ENCODE_HANDOFF();
 		NtSetEvent(encode_done, 0);
@@ -741,34 +814,29 @@ static bool finish_parallel_encode(int64_t timeout)
 	return true;
 }
 
-static bool encode_parallel_frame(const struct r360_video_layout *layout, struct r360_video_job *job)
+static bool dispatch_parallel_encode(void)
 {
 	if (!encoder_thread_created)
-		return encode_fast_rows(video_frame, jpeg_pixels, layout->width, 0, layout->height, job);
-	u32 cut = (layout->height / 2) & ~3u;
-	encode_work.output = video_frame;
-	encode_work.pixels = jpeg_pixels;
-	encode_work.width = layout->width;
-	encode_work.first = cut;
-	encode_work.end = layout->height;
+		return false;
 	encoder_inflight = true;
 	ENCODE_HANDOFF();
-	u32 started = capture_ticks();
 	if (NtSetEvent(encode_start, 0) < 0) {
 		encoder_inflight = false;
 		encoder_thread_created = false;
 		g_r360.parallel_ready = 0;
-		return encode_fast_rows(video_frame, jpeg_pixels, layout->width, 0, layout->height, job);
+		return false;
 	}
-	u32 main_started = capture_ticks();
-	bool valid = encode_fast_rows(video_frame, jpeg_pixels, layout->width, 0, cut, job);
-	g_r360.parallel_main_us = capture_us(capture_ticks() - main_started);
-	/* Give the worker up to two display ticks, including the work already
-	 * done on this thread. Keep processing input while waiting. */
+	return true;
+}
+
+static bool join_parallel_encode(struct r360_video_job *job, bool valid, u32 started, u32 budget_us)
+{
+	/* The worker retains its buffers after cancellation or a timeout.
+	 * The network loop waits for it before dispatching another frame. */
 	while (!finish_parallel_encode(0)) {
 		if (!valid || !service_video_job(job))
 			return false;
-		if (capture_us(capture_ticks() - started) < 34000) {
+		if (capture_us(capture_ticks() - started) < budget_us) {
 			if (finish_parallel_encode(-20000))
 				break;
 			continue;
@@ -787,6 +855,25 @@ static bool encode_parallel_frame(const struct r360_video_layout *layout, struct
 	}
 	return false;
 }
+
+#ifndef R360_FUSED_SCAN
+static bool encode_parallel_frame(const struct r360_video_layout *layout, struct r360_video_job *job)
+{
+	u32 cut = (layout->height / 2) & ~3u;
+	encode_work.output = video_frame;
+	encode_work.pixels = jpeg_pixels;
+	encode_work.width = layout->width;
+	encode_work.first = cut;
+	encode_work.end = layout->height;
+	u32 started = capture_ticks();
+	if (!dispatch_parallel_encode())
+		return encode_fast_rows(video_frame, jpeg_pixels, layout->width, 0, layout->height, job);
+	u32 main_started = capture_ticks();
+	bool valid = encode_fast_rows(video_frame, jpeg_pixels, layout->width, 0, cut, job);
+	g_r360.parallel_main_us = capture_us(capture_ticks() - main_started);
+	return join_parallel_encode(job, valid, started, 34000);
+}
+#endif
 #endif
 
 #ifdef R360_VIDEO_SETTINGS
@@ -808,26 +895,43 @@ static void reset_video_limits(void)
 #endif
 }
 
-static void adapt_jpeg_burst(u64 now)
+static void adapt_video_transport(u64 now, const struct r360_video_layout *layout)
 {
+	bool jpeg = layout->packet_type == R360_PACKET_VIDEO_JPEG;
 	if (!burst_last_check || now - last_feedback_ms > 750) {
 		burst_last_check = now;
-		burst_last_sent = g_r360.jpeg_frames;
+		burst_last_sent = g_r360.video_frames;
 		burst_last_displayed = g_r360.client_frames_displayed;
 		return;
 	}
 	if (now - burst_last_check < 2000)
 		return;
-	u32 sent = g_r360.jpeg_frames - burst_last_sent;
+	u32 sent = g_r360.video_frames - burst_last_sent;
 	u32 displayed = g_r360.client_frames_displayed - burst_last_displayed;
 	if (sent >= 12 && r360_rates[video_rate] >= 30) {
-		if (displayed + 2 >= (sent * 9) / 10)
-			burst_limit = MIN(burst_limit + 16, 112u);
-		else if (displayed + 2 < (sent * 7) / 10 && burst_limit > 40)
-			burst_limit = burst_limit >= 56 ? burst_limit - 16 : 40;
+		bool weak = displayed + 2 < (sent * 7) / 10;
+		if (jpeg) {
+			if (displayed + 2 >= (sent * 9) / 10)
+				burst_limit = MIN(burst_limit + 16, 112u);
+			else if (weak && burst_limit > 40)
+				burst_limit = burst_limit >= 56 ? burst_limit - 16 : 40;
+#ifdef R360_FUSED_SCAN
+			else if (weak) {
+				encoder_low_quality = true;
+				encoder_limited = true;
+			}
+#endif
+		}
+#ifdef R360_FUSED_SCAN
+		else if (weak && layout->width > 320) {
+			u8 profile = r360_profile_for_source(video_profile, layout->width, layout->height);
+			capture_max_profile = MIN(capture_max_profile, (u8)(profile - 1));
+			g_r360.fast_drops++;
+		}
+#endif
 	}
 	burst_last_check = now;
-	burst_last_sent = g_r360.jpeg_frames;
+	burst_last_sent = g_r360.video_frames;
 	burst_last_displayed = g_r360.client_frames_displayed;
 	g_r360.jpeg_burst = burst_limit;
 }
@@ -838,10 +942,65 @@ static void clear_jpeg_buffers(void)
 		ExFreePool(jpeg_pixels);
 	if (jpeg_output)
 		ExFreePool(jpeg_output);
+#ifdef R360_FUSED_SCAN
+	if (jpeg_bottom)
+		ExFreePool(jpeg_bottom);
+	jpeg_bottom = 0;
+#endif
+#ifdef R360_SCANOUT_SNAPSHOT
+	if (scanout_snapshot)
+		ExFreePool(scanout_snapshot);
+	scanout_snapshot = 0;
+	snapshot_capacity = 0;
+#endif
 	jpeg_pixels = 0;
 	jpeg_output = 0;
 	jpeg_pixel_capacity = 0;
 }
+
+#ifdef R360_SCANOUT_SNAPSHOT
+static bool prepare_scanout_snapshot(u32 bytes)
+{
+	if (bytes > SNAPSHOT_MAX_BYTES)
+		return false;
+	if (bytes <= snapshot_capacity)
+		return true;
+	u8 *snapshot = ExAllocatePoolWithTag(bytes, 0x5233534e);
+	if (!snapshot) {
+		g_r360.snapshot_alloc_errors++;
+		return false;
+	}
+	if (scanout_snapshot)
+		ExFreePool(scanout_snapshot);
+	scanout_snapshot = snapshot;
+	snapshot_capacity = bytes;
+	return true;
+}
+
+static enum r360_video_capture_result snapshot_scanout(const volatile u8 *live, u32 bytes,
+						      const u32 *offsets, const u32 *anchors,
+						      u32 count, struct r360_video_job *job)
+{
+	u32 start = capture_ticks();
+	g_r360.snapshot_attempts++;
+	for (u32 offset = 0; offset < bytes; offset += SNAPSHOT_CHUNK_BYTES) {
+		r360_copy_scanout_block(scanout_snapshot + offset, live + offset,
+				       MIN(SNAPSHOT_CHUNK_BYTES, bytes - offset));
+		if (!service_fast_job(job)) {
+			g_r360.snapshot_copy_us = capture_us(capture_ticks() - start);
+			g_r360.snapshot_cancelled++;
+			return R360_CAPTURE_CANCELLED;
+		}
+	}
+	g_r360.snapshot_copy_us = capture_us(capture_ticks() - start);
+	if (!r360_scanout_matches(live, scanout_snapshot, offsets, anchors, count)) {
+		g_r360.snapshot_recycled++;
+		return R360_CAPTURE_CHANGED;
+	}
+	g_r360.snapshot_accepted++;
+	return R360_CAPTURE_OK;
+}
+#endif
 
 static bool prepare_capture_pixels(u32 pixels)
 {
@@ -879,6 +1038,9 @@ static const struct r360_video_layout *select_layout(const struct r360_surface *
 			g_r360.capture_limit = 1;
 			profile = ARRAY_SIZE(fast_layouts) - 1;
 		}
+#ifdef R360_FUSED_SCAN
+		return &fast_layouts[profile];
+#else
 		for (;;) {
 			const struct r360_video_layout *layout = &fast_layouts[profile];
 			if (prepare_capture_pixels((u32)layout->width * layout->height))
@@ -889,6 +1051,7 @@ static const struct r360_video_layout *select_layout(const struct r360_surface *
 				return &r360_rgb565;
 			encoder_max_profile = --profile;
 		}
+#endif
 	}
 #endif
 	while (profile >= 2) {
@@ -905,6 +1068,11 @@ static const struct r360_video_layout *select_layout(const struct r360_surface *
 		encoder_max_profile = --profile;
 		g_r360.encoder_errors++;
 	}
+#ifdef R360_SCANOUT_SNAPSHOT
+	/* A quality request that has fallen back to BC1 still gets the fused path. */
+	if (video_profile >= 2)
+		return &fast_layouts[profile];
+#endif
 	return profile == 1 ? &r360_bc1 : &r360_rgb565;
 }
 
@@ -948,7 +1116,85 @@ static void prepare_jpeg_map(const struct r360_surface *surface, u32 width, u32 
 #endif
 }
 
-#ifdef R360_LOW_LATENCY
+#ifdef R360_FUSED_SCAN
+static bool scan_progress(void *context)
+{
+	return service_fast_job(context);
+}
+
+static bool scan_parallel_frame(const struct r360_surface *surface, const volatile u8 *fb,
+				u32 width, u32 height, u32 format, struct r360_video_job *job)
+{
+	struct r360_scan_slice slice = {
+		.source = fb, .columns = jpeg_columns, .rows = jpeg_rows, .column_end = column_run,
+		.output = video_frame, .width = width, .height = height, .end = height,
+		.format = format, .swap_mode = surface->swap_mode,
+		.reconstruct_rows = job->reconstruct_rows,
+	};
+	work_kind = R360_WORK_BC1;
+	encode_work.scan = slice;
+	encode_work.scan.first = (height / 2) & ~3u;
+	u32 started = capture_ticks();
+	if (!dispatch_parallel_encode())
+		return r360_scan_bc1(&slice, scan_progress, job);
+	slice.end = encode_work.scan.first;
+	bool valid = r360_scan_bc1(&slice, scan_progress, job);
+	g_r360.parallel_main_us = capture_us(capture_ticks() - started);
+	return join_parallel_encode(job, valid, started, 75000);
+}
+
+static bool copy_parallel_jpeg(const struct r360_surface *surface, const volatile u8 *fb,
+			       u32 width, u32 height, u32 format, struct r360_video_job *job)
+{
+	struct r360_jpeg_capture slice = {
+		.source = fb, .columns = jpeg_columns, .rows = jpeg_rows, .pixels = jpeg_pixels,
+		.width = width, .end = height, .format = format, .swap_mode = surface->swap_mode,
+		.native_bgrx = width == surface->width && !(surface->x_offset & 1) &&
+			       !format && !surface->swap_mode,
+	};
+	work_kind = R360_WORK_JPEG_COPY;
+	encode_work.copy = slice;
+	encode_work.copy.first = (height / 2) & ~15u;
+	u32 started = capture_ticks();
+	if (!dispatch_parallel_encode())
+		return r360_copy_jpeg_rows(&slice, scan_progress, job);
+	slice.end = encode_work.copy.first;
+	bool valid = r360_copy_jpeg_rows(&slice, scan_progress, job);
+	g_r360.parallel_main_us = capture_us(capture_ticks() - started);
+	return join_parallel_encode(job, valid, started, 1500000);
+}
+
+static int encode_parallel_jpeg(const struct r360_video_layout *layout, struct r360_video_job *job)
+{
+	u32 cut = (layout->height / 2) & ~15u;
+	if (encoder_thread_created && !jpeg_bottom)
+		jpeg_bottom = ExAllocatePoolWithTag(R360_JPEG_MAX_BYTES, 0x52334a42);
+	if (jpeg_bottom) {
+		work_kind = R360_WORK_JPEG_ENCODE;
+		encode_work.jpeg = (struct r360_jpeg_encode){
+			.pixels = jpeg_pixels, .output = jpeg_bottom, .width = layout->width,
+			.height = layout->height, .first = cut, .low_quality = encoder_low_quality,
+		};
+		u32 started = capture_ticks();
+		if (dispatch_parallel_encode()) {
+			int bytes = r360_encode_jpeg_slice(jpeg_pixels, layout->width, layout->height, 0, cut,
+							   jpeg_output, R360_JPEG_MAX_BYTES, encoder_low_quality,
+							   service_video_job, job);
+			g_r360.parallel_main_us = capture_us(capture_ticks() - started);
+			if (!join_parallel_encode(job, bytes >= 0, started, 1500000))
+				return -1;
+			if (!bytes || encode_work_result <= 0 ||
+			    (u32)(bytes + encode_work_result) > R360_JPEG_MAX_BYTES)
+				return 0;
+			memcpy(jpeg_output + bytes, jpeg_bottom, (u32)encode_work_result);
+			g_r360.parallel_jpeg_frames++;
+			return bytes + encode_work_result;
+		}
+	}
+	return r360_encode_jpeg(jpeg_pixels, layout->width, layout->height, jpeg_output,
+				R360_JPEG_MAX_BYTES, encoder_low_quality, service_video_job, job);
+}
+#elif defined(R360_LOW_LATENCY)
 /* Walk one 32×32 Xenos tile at a time so nearby samples reuse the same
  * physical memory, then write pixels to their linear destination. */
 static bool copy_fast_tiles(const struct r360_surface *surface, const volatile u8 *fb,
@@ -1003,7 +1249,7 @@ static bool copy_fast_tiles(const struct r360_surface *surface, const volatile u
 static enum r360_video_capture_result copy_jpeg_pixels(const struct r360_surface *surface,
 						       const struct r360_video_layout *layout,
 						       const volatile u8 *fb, u32 format,
-						       struct r360_video_job *job, bool fast)
+						       struct r360_video_job *job, bool fast, u32 surface_size)
 {
 	const u32 width = layout->width;
 	const u32 height = layout->height;
@@ -1011,17 +1257,48 @@ static enum r360_video_capture_result copy_jpeg_pixels(const struct r360_surface
 	u32 anchor[64];
 	u32 offset[ARRAY_SIZE(anchor)];
 	u32 last_pixel = width * height - 1;
+#ifdef R360_SCANOUT_SNAPSHOT
+	/* Take anchors after allocation, which may itself span a display flip. */
+	if (!fast) {
+		if (!prepare_scanout_snapshot(surface_size)) {
+			/* Every JPEG profile needs the same full scanout allocation. */
+			capture_max_profile = 1;
+			g_r360.capture_limit = 1;
+			return R360_CAPTURE_CANCELLED;
+		}
+		job->staged = true;
+	}
+#else
+	(void)surface_size;
+#endif
 	for (u32 i = 0; i < ARRAY_SIZE(anchor); i++) {
 		offset[i] = jpeg_sample_offset(i * last_pixel / (ARRAY_SIZE(anchor) - 1), width);
 		anchor[i] = *(const volatile u32 *)(fb + offset[i]);
 	}
+#ifdef R360_SCANOUT_SNAPSHOT
+	if (job->staged) {
+		enum r360_video_capture_result result = snapshot_scanout(fb, surface_size, offset, anchor,
+									ARRAY_SIZE(anchor), job);
+		if (result != R360_CAPTURE_OK)
+			return result;
+		fb = scanout_snapshot;
+	}
+#endif
 #ifdef R360_LOW_LATENCY
 	if (fast) {
 #ifdef R360_CAPTURE_PROFILE
 		u32 pixels_started = capture_ticks();
 #endif
+#ifdef R360_FUSED_SCAN
+		if (!scan_parallel_frame(surface, fb, width, height, format, job)) {
+			g_r360.fused_cancellations++;
+			return R360_CAPTURE_CANCELLED;
+		}
+		job->fused = true;
+#else
 		if (!copy_fast_tiles(surface, fb, width, height, format, job))
 			return R360_CAPTURE_CANCELLED;
+#endif
 #ifdef R360_CAPTURE_PROFILE
 		job->pixel_ticks = capture_ticks() - pixels_started;
 #endif
@@ -1029,6 +1306,14 @@ static enum r360_video_capture_result copy_jpeg_pixels(const struct r360_surface
 #else
 	(void)fast;
 #endif
+#ifdef R360_FUSED_SCAN
+	{
+		u32 pixels_started = capture_ticks();
+		if (!copy_parallel_jpeg(surface, fb, width, height, format, job))
+			return R360_CAPTURE_CANCELLED;
+		job->pixel_ticks = capture_ticks() - pixels_started;
+	}
+#else
 	for (u32 y = 0; y < height; y++) {
 		if (!(y & 31) && !service_video_job(job))
 			return R360_CAPTURE_CANCELLED;
@@ -1040,6 +1325,11 @@ static enum r360_video_capture_result copy_jpeg_pixels(const struct r360_surface
 			dst[x] = r360_surface_rgb565(__builtin_bswap32(word), format, surface->swap_mode);
 		}
 	}
+#endif
+#ifdef R360_SCANOUT_SNAPSHOT
+	if (job->staged)
+		return R360_CAPTURE_OK;
+#endif
 	for (u32 i = 0; i < ARRAY_SIZE(anchor); i++)
 		if (*(const volatile u32 *)(fb + offset[i]) != anchor[i]) {
 #ifdef R360_LOW_LATENCY
@@ -1106,6 +1396,12 @@ static enum r360_video_capture_result capture_video_frame(const struct r360_vide
 		is_jpeg = layout == jpeg;
 #ifdef R360_LOW_LATENCY
 		is_fast = video_fast && layout->packet_type == R360_PACKET_VIDEO_BC1;
+#ifdef R360_SCANOUT_SNAPSHOT
+		if (!is_fast && video_profile >= 2 && layout->packet_type == R360_PACKET_VIDEO_BC1) {
+			is_fast = true;
+			job->reconstruct_rows = r360_rates[video_rate] == 60;
+		}
+#endif
 #endif
 	}
 #else
@@ -1136,7 +1432,8 @@ static enum r360_video_capture_result capture_video_frame(const struct r360_vide
 
 #ifdef R360_VIDEO_SETTINGS
 	if (is_jpeg || is_fast) {
-		enum r360_video_capture_result result = copy_jpeg_pixels(&surface, layout, fb, format, job, is_fast);
+		enum r360_video_capture_result result = copy_jpeg_pixels(&surface, layout, fb, format, job,
+									  is_fast, surface_size);
 		if (result != R360_CAPTURE_OK)
 			return result;
 		if (XENOS_DISPLAY[GRPH_CONTROL] != control || XENOS_DISPLAY[GRPH_SWAP_CONTROL] != swap ||
@@ -1231,6 +1528,10 @@ static void send_video_frame(u32 socket)
 #ifdef R360_LOW_LATENCY
 		watch_capture |= fast && layout->packet_type == R360_PACKET_VIDEO_BC1 && layout->width > 320;
 #endif
+#ifdef R360_SCANOUT_SNAPSHOT
+		/* Changing JPEG resolution does not shorten a full scanout copy. */
+		watch_capture &= !job.staged;
+#endif
 		if (watch_capture && result == R360_CAPTURE_CHANGED && ++rejected_snapshots >= 8) {
 			u8 profile = r360_profile_for_source(video_profile, layout->width, layout->height);
 			capture_max_profile = profile - 1;
@@ -1251,13 +1552,20 @@ static void send_video_frame(u32 socket)
 #ifdef R360_EXPERIMENTAL_MEDIA
 	stamp = xa_now_ms();
 #ifdef R360_LOW_LATENCY
+#ifdef R360_FUSED_SCAN
+	if (job.fused || (fast && layout->packet_type == R360_PACKET_VIDEO_BC1)) {
+		/* The scan stage already wrote the BC1 blocks. */
+		if (!job.fused)
+			return;
+#else
 	if (fast && layout->packet_type == R360_PACKET_VIDEO_BC1) {
-#ifdef R360_PARALLEL_BC1
+#if defined(R360_PARALLEL_BC1)
 		if (!encode_parallel_frame(layout, &job))
 			return;
 #else
 		if (!encode_fast_rows(video_frame, jpeg_pixels, layout->width, 0, layout->height, &job))
 			return;
+#endif
 #endif
 	} else
 #endif
@@ -1275,9 +1583,13 @@ static void send_video_frame(u32 socket)
 	}
 #ifdef R360_VIDEO_SETTINGS
 	if (layout == &jpeg_layout) {
+#ifdef R360_FUSED_SCAN
+		int bytes = encode_parallel_jpeg(layout, &job);
+#else
 		int bytes = r360_encode_jpeg(jpeg_pixels, layout->width, layout->height,
 					     jpeg_output, R360_JPEG_MAX_BYTES, encoder_low_quality,
 					     service_video_job, &job);
+#endif
 		if (bytes < 0)
 			return;
 		if (!bytes) {
@@ -1303,8 +1615,13 @@ static void send_video_frame(u32 socket)
 	u32 profile_after_encode = capture_ticks();
 #endif
 	frame_id = ++video_frame_id;
+#ifdef R360_FUSED_SCAN
+	struct r360_packet_order order;
+	r360_packet_order_init(&order, layout->chunks, job.parity);
+#else
 	u32 chunk = 0;
 	u32 group = 0;
+#endif
 	u32 groups = (layout->chunks + R360_VIDEO_PARITY_GROUP - 1) / R360_VIDEO_PARITY_GROUP;
 	u32 total_packets = layout->chunks + (job.parity ? groups : 0);
 	u32 burst = R360_VIDEO_PACKETS_PER_BURST;
@@ -1325,10 +1642,21 @@ static void send_video_frame(u32 socket)
 #endif
 		}
 		int size;
+#ifdef R360_FUSED_SCAN
+		u32 index;
+		bool parity_packet;
+		if (!r360_packet_order_next(&order, &index, &parity_packet))
+			return;
+		if (parity_packet)
+			size = r360_layout_parity_packet(packet, layout, frame_data, frame_id, index);
+		else
+			size = r360_layout_packet(packet, layout, frame_data, frame_id, index);
+#else
 		if (job.parity && chunk == MIN((group + 1) * R360_VIDEO_PARITY_GROUP, (u32)layout->chunks))
 			size = r360_layout_parity_packet(packet, layout, frame_data, frame_id, group++);
 		else
 			size = r360_layout_packet(packet, layout, frame_data, frame_id, chunk++);
+#endif
 		while (net.sendto(R360_XNCALLER_SYSAPP, socket, (const char *)packet, size, 0,
 				   (const struct r360_sockaddr *)&job.destination, sizeof(job.destination)) != size) {
 			u32 error = (u32)net.last_error(R360_XNCALLER_SYSAPP);
@@ -1358,10 +1686,12 @@ static void send_video_frame(u32 socket)
 	if (layout->packet_type == R360_PACKET_VIDEO_BC1)
 		g_r360.bc1_frames++;
 #endif
-#ifdef R360_LOW_LATENCY
-	if (fast && layout->packet_type == R360_PACKET_VIDEO_BC1) {
-		g_r360.fast_frames++;
 #ifdef R360_CAPTURE_PROFILE
+	bool profile_frame = fast && layout->packet_type == R360_PACKET_VIDEO_BC1;
+#ifdef R360_FUSED_SCAN
+	profile_frame |= layout == &jpeg_layout || job.fused;
+#endif
+	if (profile_frame) {
 		u32 profile_after_send = capture_ticks();
 		g_r360.profile_surface_address = job.surface_address;
 		g_r360.profile_display_us = capture_us(job.display_ticks);
@@ -1376,6 +1706,13 @@ static void send_video_frame(u32 socket)
 		else
 			g_r360.profile_map_full++;
 		g_r360.profile_frames++;
+	}
+#endif
+#ifdef R360_LOW_LATENCY
+	if (fast && layout->packet_type == R360_PACKET_VIDEO_BC1) {
+		g_r360.fast_frames++;
+#ifdef R360_FUSED_SCAN
+		g_r360.fused_frames++;
 #endif
 #ifdef R360_FAST_SCAN
 		if (job.reconstruct_rows)
@@ -1401,8 +1738,12 @@ static void send_video_frame(u32 socket)
 	if (layout == &jpeg_layout) {
 		g_r360.jpeg_frames++;
 		g_r360.jpeg_bytes += layout->bytes;
-		adapt_jpeg_burst(xa_now_ms());
+		adapt_video_transport(xa_now_ms(), layout);
 	}
+#ifdef R360_FUSED_SCAN
+	else if (job.fused)
+		adapt_video_transport(xa_now_ms(), layout);
+#endif
 #endif
 }
 
@@ -1500,10 +1841,8 @@ static void accept_packet(const u8 *p, const struct r360_sockaddr_in *from)
 		profile = 0;
 	if (rate >= ARRAY_SIZE(r360_rates))
 		rate = R360_DEFAULT_RATE_INDEX;
-	if (mode_changed || configurable != video_configurable || profile != video_profile) {
-		reset_video_limits();
-	}
 	if (mode_changed || configurable != video_configurable || profile != video_profile || rate != video_rate) {
+		reset_video_limits();
 		video_config_generation++;
 		next_video_due = 0;
 	}
@@ -1619,10 +1958,13 @@ __attribute__((used, noinline)) u32 R360NetThreadC(void *context)
 	}
 	g_r360.socket = (u32)sock;
 	g_r360.state = R360_STATE_LISTENING;
+#ifdef R360_SCANOUT_SNAPSHOT
+	g_r360.snapshot_load_stage = 3;
+#endif
 	last_input_ms = xa_now_ms();
 	last_status_ms = last_input_ms;
 	last_video_ms = last_input_ms;
-#ifdef R360_PARALLEL_BC1
+#if defined(R360_PARALLEL_BC1) && !defined(R360_SCANOUT_SNAPSHOT)
 	start_encoder_thread();
 #endif
 
@@ -1670,6 +2012,13 @@ __attribute__((used, noinline)) u32 R360NetThreadC(void *context)
 				clear_jpeg_buffers();
 #endif
 			if (peer_valid && video_requested && !watchdog_neutral && due) {
+#if defined(R360_PARALLEL_BC1) && defined(R360_SCANOUT_SNAPSHOT)
+				/* Leave the encoder idle across title launches before a stream is requested. */
+				if (!encoder_start_attempted) {
+					encoder_start_attempted = true;
+					start_encoder_thread();
+				}
+#endif
 				last_video_ms = now;
 				send_video_frame((u32)sock);
 #ifdef R360_LOW_LATENCY
@@ -1706,8 +2055,20 @@ __attribute__((used, noinline)) int DllMainC(unsigned int handle, unsigned int r
 {
 	(void)handle;
 	(void)reserved;
-	if (reason == 1)
+	if (reason == 1) {
+#ifdef R360_SCANOUT_SNAPSHOT
+		g_r360.snapshot_load_stage = 1;
+#endif
+#ifdef R360_SNAPSHOT_LOAD_ONLY
+		/* Keep the same compiled code linked, but never start it in the load probe. */
+		static volatile u8 load_only = 1;
+		if (load_only) {
+			g_r360.snapshot_load_stage = 2;
+			return 1;
+		}
+#endif
 		start();
+	}
 	return 1;
 }
 
