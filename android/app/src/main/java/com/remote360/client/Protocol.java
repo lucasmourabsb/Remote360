@@ -56,8 +56,13 @@ final class Protocol {
 
     static byte[] inputPacket(int sequence, GamepadState.Snapshot state, boolean video, int settings, boolean fast) {
         if (settings < 0) return inputPacket(sequence, state, video);
-        int flags = 0x40 | ((settings & 15) == 1 ? 0x20 : 0) | (fast ? 0x80 : 0);
+        int profile = settings & 15;
+        int flags = 0x40 | (profile == 1 ? 0x20 : 0) | (fast && supportsFastVideo(profile) ? 0x80 : 0);
         return inputPacket(sequence, state, video, flags, settings);
+    }
+
+    static boolean supportsFastVideo(int profile) {
+        return profile >= 0 && profile < WIDTHS.length && WIDTHS[profile] <= 640;
     }
 
     private static byte[] inputPacket(int sequence, GamepadState.Snapshot state, boolean video,

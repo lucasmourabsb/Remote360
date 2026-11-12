@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 
 public final class UdpClientTest {
@@ -42,6 +43,38 @@ public final class UdpClientTest {
             }
             assertFalse(worker.isAlive());
         }
+    }
+
+    @Test
+    public void consoleCanStartListeningAfterTheAppConnects() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        int port;
+        try (DatagramSocket reservation = new DatagramSocket(0, loopback)) {
+            port = reservation.getLocalPort();
+        }
+        ArrayBlockingQueue<String> errors = new ArrayBlockingQueue<>(1);
+        UdpClient client = new UdpClient("127.0.0.1", port, new GamepadState(), true,
+                new UdpClient.Listener() {
+            @Override public void onStatus(UdpClient source, Protocol.Status status, long ackMs) {}
+            @Override public void onRumble(UdpClient source, Protocol.Rumble rumble) {}
+            @Override public void onVideoFrame(UdpClient source, UdpClient.VideoFrame frame) {}
+            @Override public void onNetworkError(UdpClient source, String message) { errors.offer(message); }
+        });
+        Thread worker = new Thread(client);
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            Thread.sleep(80);
+            try (DatagramSocket xbox = new DatagramSocket(port, loopback)) {
+                xbox.setSoTimeout(1000);
+                awaitVideoFlag(xbox, true, 0);
+            }
+            assertNull(errors.poll());
+        } finally {
+            client.stop();
+            worker.join(1500);
+        }
+        assertFalse(worker.isAlive());
     }
 
     @Test

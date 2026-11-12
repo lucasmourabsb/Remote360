@@ -44,6 +44,25 @@ public class FrameAssemblerTest {
         assertNull(accept(assembler, 0xFFFFFFFFL, 0));
     }
 
+    @Test public void lateParityCanCompletePreviousFrameWhileNextIsInFlight() {
+        FrameAssembler assembler = new FrameAssembler();
+        assertNull(accept(assembler, 3, 0));
+        assertNull(accept(assembler, 4, 0));
+        byte[] parity = parity(3, 32, 32, 0);
+        byte[] recovered = assembler.accept(parity, Protocol.parseVideo(parity, parity.length));
+        assertNotNull(recovered);
+        for (int i = 0; i < recovered.length; i++) assertEquals((byte) i, recovered[i]);
+        assertNotNull(accept(assembler, 4, 1));
+    }
+
+    @Test public void completedNewerFrameInvalidatesPreviousAcrossWrap() {
+        FrameAssembler assembler = new FrameAssembler();
+        assertNull(accept(assembler, 0xFFFFFFFFL, 0));
+        assertNull(accept(assembler, 0, 0));
+        assertNotNull(accept(assembler, 0, 1));
+        assertNull(accept(assembler, 0xFFFFFFFFL, 1));
+    }
+
     @Test public void parityRecoversTheShortFinalChunkEvenIfParityArrivesFirst() {
         FrameAssembler assembler = new FrameAssembler();
         byte[] parity = parity(3, 32, 32, 0);

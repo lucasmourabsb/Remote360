@@ -80,6 +80,51 @@ static inline int r360_layout_parity_packet(u8 *packet, const struct r360_video_
 	return (int)(header + R360_VIDEO_PAYLOAD_MAX);
 }
 
+/* Interleave up to four XOR groups to spread bursts of packet loss.
+ * The last window can have fewer groups or a short group. */
+struct r360_packet_order {
+	u16 chunks, groups, first_group;
+	u8 row, column;
+	bool parity;
+};
+
+static inline void r360_packet_order_init(struct r360_packet_order *order, u16 chunks, bool parity)
+{
+	*order = (struct r360_packet_order){
+		.chunks = chunks, .groups = (chunks + R360_VIDEO_PARITY_GROUP - 1) / R360_VIDEO_PARITY_GROUP,
+		.parity = parity,
+	};
+}
+
+static inline bool r360_packet_order_next(struct r360_packet_order *order, u32 *index, bool *parity)
+{
+	if (!order->parity) {
+		if (order->first_group >= order->chunks)
+			return false;
+		*index = order->first_group++;
+		*parity = false;
+		return true;
+	}
+	while (order->first_group < order->groups) {
+		u32 group = order->first_group + order->column;
+		u32 chunk = group * R360_VIDEO_PARITY_GROUP + order->row;
+		bool parity_row = order->row == R360_VIDEO_PARITY_GROUP;
+		if (++order->column == 4 || group + 1 == order->groups) {
+			order->column = 0;
+			if (++order->row > R360_VIDEO_PARITY_GROUP) {
+				order->row = 0;
+				order->first_group += 4;
+			}
+		}
+		if (parity_row || chunk < order->chunks) {
+			*index = parity_row ? group : chunk;
+			*parity = parity_row;
+			return true;
+		}
+	}
+	return false;
+}
+
 static inline int r360_video_packet(u8 *packet, const u8 *frame, u32 frame_id, u32 chunk)
 {
 	return r360_layout_packet(packet, &r360_rgb565, frame, frame_id, chunk);

@@ -39,6 +39,19 @@ public class ProtocolTest {
         assertNull(Protocol.parseRumble(new byte[12], 12));
     }
 
+    @Test public void selecting720pKeepsTheProfileEvenWithAnOldFastModePreference() {
+        GamepadState.Snapshot state = new GamepadState.Snapshot(0, false, 0, 0, 0, 0, 0, 0);
+        byte[] fullHd = Protocol.inputPacket(1, state, true, 0x35, true);
+        byte[] hd = Protocol.inputPacket(2, state, true, 0x34, true);
+        byte[] fast = Protocol.inputPacket(3, state, true, 0x32, true);
+        assertEquals(0x35, fullHd[7] & 0xff);
+        assertEquals(0x34, hd[7] & 0xff);
+        assertEquals(0x40, hd[6] & 0xc0);
+        assertEquals(0x40, fullHd[6] & 0xc0);
+        assertEquals(0x32, fast[7] & 0xff);
+        assertEquals(0xc0, fast[6] & 0xc0);
+    }
+
     @Test public void statusPreservesUnsignedAcknowledgement() {
         ByteBuffer b = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
         b.put(new byte[]{'R', '3', '6', '0', 1, 2, 4, 3});

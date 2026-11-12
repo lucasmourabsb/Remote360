@@ -5,12 +5,13 @@
 #include "vendor/jpge/JPEGENC.h"
 #include "vendor/jpge/jpegenc.inl"
 
-int r360_encode_jpeg(const u16 *pixels, u32 width, u32 height,
-		    u8 *output, u32 capacity, bool low_quality,
-		    r360_jpeg_progress progress, void *context)
+int r360_encode_jpeg_slice(const u16 *pixels, u32 width, u32 height, u32 first, u32 end,
+			  u8 *output, u32 capacity, bool low_quality,
+			  r360_jpeg_progress progress, void *context)
 {
 	if (!pixels || !output || width < 16 || height < 16 || (width & 1) ||
-	    (height & 1) || width > 1920 || height > 1080 || capacity < 8192)
+	    (height & 1) || width > 1920 || height > 1080 || capacity < 8192 ||
+	    first >= end || end > height || (first & 15) || (end != height && (end & 15)))
 		return 0;
 
 	/* The library checks bounds after each MCU. A 4:2:0 MCU has six 8×8
@@ -24,8 +25,15 @@ int r360_encode_jpeg(const u16 *pixels, u32 width, u32 height,
 	if (JPEGEncodeBegin(&image, &encode, (int)width, (int)height, JPEGE_PIXEL_RGB565,
 			    JPEGE_SUBSAMPLE_420, quality) != JPEGE_SUCCESS)
 		return 0;
+	/* JPGE flushes the bitstream and resets all DC predictors on each MCU
+	 * row. Starting with the absolute restart number preserves the stream. */
+	if (first) {
+		image.pc.pOut = output;
+		image.iRestart = (int)first / 16;
+		encode.y = (int)first;
+	}
 	u16 edge[16 * 16];
-	while (encode.y < (int)height) {
+	while (encode.y < (int)end) {
 		u32 x = (u32)encode.x;
 		u32 y = (u32)encode.y;
 		const u16 *mcu = pixels + y * width + x;
@@ -46,5 +54,13 @@ int r360_encode_jpeg(const u16 *pixels, u32 width, u32 height,
 		if (encode.x == 0 && progress && !progress(context))
 			return -1;
 	}
-	return JPEGEncodeEnd(&image);
+	return end == height ? JPEGEncodeEnd(&image) : (int)(image.pc.pOut - output);
+}
+
+int r360_encode_jpeg(const u16 *pixels, u32 width, u32 height,
+		    u8 *output, u32 capacity, bool low_quality,
+		    r360_jpeg_progress progress, void *context)
+{
+	return r360_encode_jpeg_slice(pixels, width, height, 0, height, output, capacity,
+				     low_quality, progress, context);
 }
